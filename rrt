@@ -1,0 +1,420 @@
+#!/usr/bin/env python
+"""
+ESE 680
+RRT assignment
+Author: Hongrui Zheng
+This file contains the class definition for tree nodes and RRT
+Before you start, please read: https://arxiv.org/pdf/1105.1186.pdf
+"""
+import numpy as np
+from numpy import linalg as LA
+import math
+import tf
+
+import rospy
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Point
+from ackermann_msgs.msg import AckermannDriveStamped
+from nav_msgs.msg import OccupancyGrid
+#from tf import transform_listener
+from tf.transformations import euler_from_quaternion
+from visualization_msgs.msg import Marker
+from nav_msgs.srv import GetMap
+
+# TODO: import as you need
+
+# class def for tree nodes
+# It's up to you if you want to use this
+class Node(object):
+    def __init__(self):
+        self.x = None
+        self.y = None
+        self.parent = None
+        self.cost = None # only used in RRT*
+        self.is_root = False
+
+# class def for RRT
+class RRT(object):
+    def __init__(self):
+        # topics, not saved as attributes
+        # TODO: grab topics from param file, you'll need to change the yaml file
+        pf_topic = '/odom' #'/pf/viz/inferred_pose'#rospy.get_param('pose_topic')
+        scan_topic = '/scan'#rospy.get_param('scan_topic')
+
+        # parameters
+        self.ANGLE_STEP        = int(rospy.get_param("~angle_step"))
+        self.MAX_PARTICLES     = int(rospy.get_param("~max_particles"))
+        self.MAX_VIZ_PARTICLES = int(rospy.get_param("~max_viz_particles"))
+        self.INV_SQUASH_FACTOR = 1.0 / float(rospy.get_param("~squash_factor"))
+        self.MAX_RANGE_METERS  = float(rospy.get_param("~max_range"))
+        self.THETA_DISCRETIZATION = int(rospy.get_param("~theta_discretization"))
+        self.WHICH_RM          = rospy.get_param("~range_method", "cddt").lower()
+        self.RANGELIB_VAR      = int(rospy.get_param("~rangelib_variant", "3"))
+        self.SHOW_FINE_TIMING  = bool(rospy.get_param("~fine_timing", "0"))
+        self.PUBLISH_ODOM      = bool(rospy.get_param("~publish_odom", "1"))
+        self.DO_VIZ            = bool(rospy.get_param("~viz"))
+
+        # sensor model constants
+        self.Z_SHORT   = float(rospy.get_param("~z_short", 0.01))
+        self.Z_MAX     = float(rospy.get_param("~z_max", 0.07))
+        self.Z_RAND    = float(rospy.get_param("~z_rand", 0.12))
+        self.Z_HIT     = float(rospy.get_param("~z_hit", 0.75))
+        self.SIGMA_HIT = float(rospy.get_param("~sigma_hit", 8.0))
+
+        # motion model constants
+        self.MOTION_DISPERSION_X = float(rospy.get_param("~motion_dispersion_x", 0.05))
+        self.MOTION_DISPERSION_Y = float(rospy.get_param("~motion_dispersion_y", 0.025))
+        self.MOTION_DISPERSION_THETA = float(rospy.get_param("~motion_dispersion_theta", 0.25))
+        
+        # various data containers used in the MCL algorithm
+        self.MAX_RANGE_PX = None
+        self.odometry_data = np.array([0.0,0.0,0.0])
+        self.laser = None
+        self.iters = 0
+        self.map_msg = None
+        #self.map_info = None
+        self.map_initialized = False
+        self.lidar_initialized = False
+        self.odom_initialized = False
+        self.last_pose = None
+        self.laser_angles = None
+        self.downsampled_angles = None
+        self.range_method = None
+        self.last_time = None
+        self.last_stamp = None
+        self.first_sensor_update = True
+
+        # cache this to avoid memory allocation in motion model
+        self.local_deltas = np.zeros((self.MAX_PARTICLES, 3))
+
+        # cache this for the sensor model computation
+        self.queries = None
+        self.ranges = None
+        self.tiled_angles = None
+        self.sensor_model_table = None
+
+        # particle poses and weights
+        self.inferred_pose = None
+        self.particle_indices = np.arange(self.MAX_PARTICLES)
+        self.particles = np.zeros((self.MAX_PARTICLES, 3))
+        self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
+
+        # you could add your own parameters to the rrt_params.yaml file,
+        # and get them here as class attributes as shown above.
+        self.heading = 0;
+        self.x = 0;
+        self.y = 0;
+
+        # TODO: create subscribers
+        #rospy.Subscriber('/map', OccupancyGrid, self.set_map_info)
+        rospy.Subscriber(pf_topic, Odometry, self.pf_callback)
+        rospy.Subscriber(scan_topic, LaserScan, self.scan_callback)
+        
+
+        # publishers
+        # TODO: create a drive message publisher, and other publishers that you might need
+        self.mkpub = rospy.Publisher("/omap", Marker, queue_size = 1)
+
+
+        # class attributes
+        # TODO: maybe create your occupancy grid here
+        omap = self.get_omap()
+
+    def set_map_info(self, map_msg):
+      self.map_msg = map_msg
+
+    def get_omap(self):
+        '''
+        Fetch the occupancy grid map from the map_server instance, and initialize the correct
+        RangeLibc method. Also stores a matrix which indicates the permissible region of the map
+        '''
+        # this way you could give it a different map server as a parameter
+        map_service_name = rospy.get_param("~static_map", "static_map")
+        print("getting map from service: ", map_service_name)
+        rospy.wait_for_service(map_service_name)
+        map_msg = rospy.ServiceProxy(map_service_name, GetMap)().map
+
+        self.map_msg = map_msg
+        print(map_msg.info.resolution)
+        print(self.map_msg.info.origin.position.x)
+        #oMap = range_libc.PyOMap(map_msg)
+        self.MAX_RANGE_PX = int(self.MAX_RANGE_METERS / self.map_msg.info.resolution)
+
+        '''
+        # initialize range method
+        print "Initializing range method:", self.WHICH_RM
+        if self.WHICH_RM == "bl":
+            self.range_method = range_libc.PyBresenhamsLine(oMap, self.MAX_RANGE_PX)
+        elif "cddt" in self.WHICH_RM:
+            self.range_method = range_libc.PyCDDTCast(oMap, self.MAX_RANGE_PX, self.THETA_DISCRETIZATION)
+            if self.WHICH_RM == "pcddt":
+                print "Pruning..."
+                self.range_method.prune()
+        elif self.WHICH_RM == "rm":
+            self.range_method = range_libc.PyRayMarching(oMap, self.MAX_RANGE_PX)
+        elif self.WHICH_RM == "rmgpu":
+            self.range_method = range_libc.PyRayMarchingGPU(oMap, self.MAX_RANGE_PX)
+        elif self.WHICH_RM == "glt":
+            self.range_method = range_libc.PyGiantLUTCast(oMap, self.MAX_RANGE_PX, self.THETA_DISCRETIZATION)
+        '''
+        #print "Done loading map"
+
+         # 0: permissible, -1: unmapped, 100: blocked
+        array_255 = np.array(self.map_msg.data).reshape((self.map_msg.info.height, self.map_msg.info.width))
+
+        # 0: not permissible, 1: permissible
+        self.permissible_region = np.zeros_like(array_255, dtype=bool)
+        self.permissible_region[array_255==0] = 1
+        self.map_initialized = True
+    
+    def npArray_to_Point(self, arr):
+        pt = Point()
+        pt.x = arr[0]
+        pt.y = arr[1]
+        pt.z = arr[2]        
+        return pt
+
+    def scan_callback(self, scan_msg):
+        """
+        LaserScan callback, you should update your occupancy grid here
+        Args: 
+            scan_msg (LaserScan): incoming message from subscribed topic
+        Returns:
+        """
+        #set of Lidar scans converted to global xy, compare to subset of permissable region 
+        #process range data using numpy
+        ranges = scan_msg.ranges
+        range_max = scan_msg.range_max
+        range_min = scan_msg.range_min
+        valid_ranges = np.clip(ranges, range_min, range_max) #get rid of bad data
+
+        angle_indices = np.arange(valid_ranges.size)
+        angle_array = scan_msg.angle_min + angle_indices * scan_msg.angle_increment
+
+        #polar2D = np.array([valid_ranges], [angle_array])
+        observed_x = valid_ranges * np.cos(angle_array) #local to car's frame
+        observed_y = valid_ranges * np.sin(angle_array) #local to car's frame
+        
+        #transform to map .yaml origin frame
+        observed_points = np.array([observed_x, observed_y])
+        observed_points = np.transpose(observed_points)
+        
+        #np.reshape(observed_point, (1080, 2))
+
+        rotate = np.array([[math.cos(self.heading), math.sin(self.heading)],[-math.sin(self.heading), math.cos(self.heading)]])
+        #rotate = np.transpose(rotate);
+        position = np.array([self.x, self.y]) 
+        origin = np.array([self.map_msg.info.origin.position.x, self.map_msg.info.origin.position.y])
+        #print(position)
+
+        location_wrt_global = origin + position
+
+        observed_indices_wrt_global = observed_points + location_wrt_global
+
+
+        map_origin_relative_points = np.matmul(observed_indices_wrt_global, rotate)
+        map_z = np.zeros(map_origin_relative_points[:,0].size)
+        map_tuple = (map_origin_relative_points[:,0],map_origin_relative_points[:,1],map_z)
+        map_xyz = np.vstack(map_tuple)
+        map_xyz = np.transpose(map_xyz)
+
+        '''
+        #transform to global frame (0,0) = top left
+        map_origin_m = np.array([self.map_msg.info.origin.position.x, self.map_msg.info.origin.position.y])
+        map_origin_np = np.array([map_origin_m[0], map_origin_m[1]])
+
+        global_origin_relative_points = map_origin_relative_points - map_origin_np
+        global_origin_pixels = global_origin_relative_points / self.map_msg.info.resolution
+        #global_origin_pixels = np.concatenate(global_origin_pixels, np.zeros(global_origin_pixels.size,1))
+        #print(global_origin_pixels[:,0].shape)
+        #print(global_origin_pixels[:,1].shape)
+       
+        z = np.zeros(global_origin_pixels[:,0].size)
+        #print(z.shape)
+        global_tuple = (global_origin_pixels[:,0],global_origin_pixels[:,1],z)
+        global_xyz = np.vstack(global_tuple)
+        #global_xyz = np.array([[global_origin_pixels[:,0]],[ global_origin_pixels[:,1]],[z]])
+        global_xyz = np.transpose(global_xyz)
+        #[x,x,x,x,x]
+        #[y,y,y,y,y]
+        #[z,z,z,z,z]
+
+        #[x,y,z]
+        #[]
+        
+        #print(global_xyz)
+        '''
+
+
+        mk = Marker()
+        mk.header.frame_id = "/map";
+        mk.header.stamp = rospy.Time.now()
+        mk.type = 8#CUBE_LIST
+        mk.action = 0
+        mk.pose.position.x = -location_wrt_global[0] #* self.map_msg.info.resolution;
+        mk.pose.position.y = -location_wrt_global[1] #* self.map_msg.info.resolution;
+        mk.pose.position.z = 0;
+        mk.pose.orientation.x = 0.0;
+        mk.pose.orientation.y = 0.0;
+        mk.pose.orientation.z = 0.0;
+        mk.pose.orientation.w = 1.0;
+        #mk.points = map(self.npArray_to_Point, global_xyz)
+        mk.points = map(self.npArray_to_Point, map_xyz) 
+        #print(map(self.npArray_to_Point, global_xyz))
+        mk.scale.x = 0.1;
+        mk.scale.y = 0.1;
+        mk.scale.z = 0.1;
+        mk.color.a = 1.0;
+        mk.color.r = 1.0;
+        mk.color.g = 0.0;
+        mk.color.b = 0.0;
+        self.mkpub.publish(mk)
+
+        
+        #neg_limit_idx = (np.abs(angle_array + math.radians(90))).argmin()
+        #pos_limit_idx = (np.abs(angle_array - math.radians(90))).argmin()
+        #front_ranges = proc_ranges[neg_limit_idx:pos_limit_idx]
+        #What is the longest distance in the scans from -90, +90
+        #index = np.argmax(front_ranges)
+        #angle = angle_array[neg_limit_idx] + index * data.angle_increment
+
+    def pf_callback(self, pose_msg):
+        """
+        The pose callback when subscribed to particle filter's inferred pose
+        Here is where the main RRT loop happens
+        Args: 
+            pose_msg (PoseStamped): incoming message from subscribed topic
+        Returns:
+        """
+        self.quaternion = np.array([pose_msg.pose.pose.orientation.x, pose_msg.pose.pose.orientation.y, pose_msg.pose.pose.orientation.z,pose_msg.pose.pose.orientation.w])
+        self.euler = tf.transformations.euler_from_quaternion(self.quaternion)
+        
+        self.heading = self.euler[2]
+
+        self.x = pose_msg.pose.pose.position.x
+        self.y = pose_msg.pose.pose.position.y
+
+        return None
+
+    def sample(self):
+        """
+        This method should randomly sample the free space, and returns a viable point
+        Args:
+        Returns:
+            (x, y) (float float): a tuple representing the sampled point
+        """
+        x = None
+        y = None
+        return (x, y)
+
+    def nearest(self, tree, sampled_point):
+        """
+        This method should return the nearest node on the tree to the sampled point
+        Args:
+            tree ([]): the current RRT tree
+            sampled_point (tuple of (float, float)): point sampled in free space
+        Returns:
+            nearest_node (int): index of neareset node on the tree
+        """
+        nearest_node = 0
+        return nearest_node
+
+    def steer(self, nearest_node, sampled_point):
+        """
+        This method should return a point in the viable set such that it is closer 
+        to the nearest_node than sampled_point is.
+        Args:
+            nearest_node (Node): nearest node on the tree to the sampled point
+            sampled_point (tuple of (float, float)): sampled point
+        Returns:
+            new_node (Node): new node created from steering
+        """
+        new_node = None
+        return new_node
+
+    def check_collision(self, nearest_node, new_node):
+        """
+        This method should return whether the path between nearest and new_node is
+        collision free.
+        Args:
+            nearest (Node): nearest node on the tree
+            new_node (Node): new node from steering
+        Returns:
+            collision (bool): whether the path between the two nodes are in collision
+                              with the occupancy grid
+        """
+        return True
+
+    def is_goal(self, latest_added_node, goal_x, goal_y):
+        """
+        This method should return whether the latest added node is close enough
+        to the goal.
+        Args:
+            latest_added_node (Node): latest added node on the tree
+            goal_x (double): x coordinate of the current goal
+            goal_y (double): y coordinate of the current goal
+        Returns:
+            close_enough (bool): true if node is close enoughg to the goal
+        """
+        return False
+
+    def find_path(self, tree, latest_added_node):
+        """
+        This method returns a path as a list of Nodes connecting the starting point to
+        the goal once the latest added node is close enough to the goal
+        Args:
+            tree ([]): current tree as a list of Nodes
+            latest_added_node (Node): latest added node in the tree
+        Returns:
+            path ([]): valid path as a list of Nodes
+        """
+        path = []
+        return path
+
+
+
+    # The following methods are needed for RRT* and not RRT
+    def cost(self, tree, node):
+        """
+        This method should return the cost of a node
+        Args:
+            node (Node): the current node the cost is calculated for
+        Returns:
+            cost (float): the cost value of the node
+        """
+        return 0
+
+    def line_cost(self, n1, n2):
+        """
+        This method should return the cost of the straight line between n1 and n2
+        Args:
+            n1 (Node): node at one end of the straight line
+            n2 (Node): node at the other end of the straint line
+        Returns:
+            cost (float): the cost value of the line
+        """
+        return 0
+
+    def near(self, tree, node):
+        """
+        This method should return the neighborhood of nodes around the given node
+        Args:
+            tree ([]): current tree as a list of Nodes
+            node (Node): current node we're finding neighbors for
+        Returns:
+            neighborhood ([]): neighborhood of nodes as a list of Nodes
+        """
+        neighborhood = []
+        return neighborhood
+
+def main():
+    rospy.init_node('rrt')
+    rrt = RRT()
+    rospy.spin()
+
+if __name__ == '__main__':
+    main()
